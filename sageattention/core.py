@@ -18,6 +18,7 @@ import torch
 import torch.nn.functional as F
 
 from .triton.quant_per_block import per_block_int8 as per_block_int8_triton
+from .triton.quant_per_block_mean import per_block_q_mean
 from .triton.quant_per_block_varlen import per_block_int8 as per_block_int8_varlen_triton
 from .triton.attn_qk_int8_per_block import forward as attn_false
 from .triton.attn_qk_int8_per_block_causal import forward as attn_true
@@ -133,18 +134,23 @@ def sageattn(
         Shape: ``[batch_size, num_qo_heads, qo_len]``.
         Only returned if `return_lse` is True.
 
+    **kwargs
+        Additional keyword arguments forwarded to the backend implementation.
+        For SM86 (Triton backend), supports ``smooth_q`` (bool, default True) to enable
+        per-block Q mean subtraction for improved INT8 quantization accuracy.
+
     Note
     ----
     - ``num_qo_heads`` must be divisible by ``num_kv_heads``.
     - The tensors `q`, `k`, and `v` must have the dtype ``torch.float16`` or ``torch.bfloat16``
     - All tensors must be on the same cuda device.
     """
-        
+
     arch = get_cuda_arch_versions()[q.device.index]
     if arch == "sm80":
         return sageattn_qk_int8_pv_fp16_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32")
     elif arch == "sm86":
-        return sageattn_qk_int8_pv_fp16_triton(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse)
+        return sageattn_qk_int8_pv_fp16_triton(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, **kwargs)
     elif arch == "sm89":
         return sageattn_qk_int8_pv_fp8_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32+fp16")
     elif arch == "sm90":
@@ -158,15 +164,16 @@ def sageattn(
 
 
 def sageattn_qk_int8_pv_fp16_triton(
-    q: torch.Tensor, 
-    k: torch.Tensor, 
-    v: torch.Tensor, 
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
     tensor_layout: str = "HND",
     quantization_backend: str = "triton",
-    is_causal: bool =False, 
+    is_causal: bool =False,
     attn_mask: Optional[torch.Tensor] = None,
-    sm_scale: Optional[float] = None, 
+    sm_scale: Optional[float] = None,
     smooth_k: bool = True,
+    smooth_q: bool = True,
     return_lse: bool = False,
     **kwargs: Any,
 ) -> torch.Tensor:
@@ -215,6 +222,13 @@ def sageattn_qk_int8_pv_fp16_triton(
         Whether to smooth the key tensor by subtracting the mean along the sequence dimension.
         Default: True.
 
+    smooth_q : bool
+        Whether to smooth the query tensor by subtracting per-block means (blocks of 128 tokens).
+        Improves INT8 quantization accuracy by centering Q values around zero. A correction term
+        (delta_s) is computed and added inside the attention kernel to maintain mathematical equivalence.
+        Memory usage: O(B * H_q * ceil(qo_len/128) * kv_len) in float32.
+        Default: True.
+
     return_lse : bool
         Whether to return the log sum of the exponentiated attention weights. Used for cases like Ring Attention.
         Default: False.
@@ -233,10 +247,11 @@ def sageattn_qk_int8_pv_fp16_triton(
 
     Note
     ----
-    - ``num_qo_heads`` must be divisible by ``num_kv_heads``. 
+    - ``num_qo_heads`` must be divisible by ``num_kv_heads``.
     - The tensors `q`, `k`, and `v` must have the dtype ``torch.float16``, ``torch.bfloat16`` or ``torch.float32``.
     - All tensors must be on the same cuda device.
     - `smooth_k` will introduce slight overhead but will improve the accuracy under most circumstances.
+    - `smooth_q` will introduce slight overhead but will improve the accuracy under most circumstances.
     """
 
     dtype = q.dtype
@@ -300,6 +315,38 @@ def sageattn_qk_int8_pv_fp16_triton(
     if sm_scale is None:
         sm_scale = 1.0 / (head_dim_og ** 0.5)
 
+    if smooth_q:
+        q, qm = per_block_q_mean(q, tensor_layout=tensor_layout, GROUP_SIZE=128)
+
+        # Compute k' in HND layout for delta_s matmul
+        _h_qo = q.size(nh_dim)
+        _h_kv = k.size(nh_dim)
+
+        if smooth_k:
+            k_for_delta = k - km
+        else:
+            k_for_delta = k
+
+        if tensor_layout == "NHD":
+            k_for_delta = k_for_delta.transpose(1, 2)  # -> [B, H_kv, kv_len, D]
+
+        # delta_s = qm @ k'^T * sm_scale * log2(e), with GQA handling
+        _q_per_kv = _h_qo // _h_kv
+        if _q_per_kv > 1:
+            qm_r = qm.unflatten(1, (_h_kv, _q_per_kv))  # [B, H_kv, q_per_kv, G, D]
+            delta_s = torch.matmul(qm_r, k_for_delta.unsqueeze(2).transpose(-2, -1))  # [B, H_kv, q_per_kv, G, kv_len]
+            delta_s = delta_s.flatten(1, 2)  # [B, H_q, G, kv_len]
+        else:
+            delta_s = torch.matmul(qm, k_for_delta.transpose(-2, -1))  # [B, H_q, G, kv_len]
+
+        delta_s = (delta_s * sm_scale * 1.44269504).contiguous()
+
+        delta_s_mb = delta_s.numel() * 4 / (1024 * 1024)
+        if delta_s_mb > 512:
+            warnings.warn(f"smooth_q: delta_s tensor uses {delta_s_mb:.0f}MB. Consider smooth_q=False for very long sequences.")
+    else:
+        delta_s = None
+
     if quantization_backend == "triton":
         q_int8, q_scale, k_int8, k_scale = per_block_int8_triton(q, k, km=km, sm_scale=sm_scale, tensor_layout=tensor_layout)
     elif quantization_backend == "cuda":
@@ -308,7 +355,7 @@ def sageattn_qk_int8_pv_fp16_triton(
         raise ValueError(f"Unsupported quantization backend: {quantization_backend}")
     if is_causal:
         assert attn_mask is None, "Mask should be None for causal attention."
-        o, lse = attn_true(q_int8, k_int8, v, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=dtype, return_lse=return_lse)
+        o, lse = attn_true(q_int8, k_int8, v, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=dtype, return_lse=return_lse, delta_s=delta_s)
     else:
         if attn_mask is not None:
             if tensor_layout == "HND":
@@ -321,7 +368,7 @@ def sageattn_qk_int8_pv_fp16_triton(
                 attn_mask = attn_mask.expand(target_shape)
             except Exception:
                 raise AssertionError(f"attn_mask shape {attn_mask.shape} cannot be broadcast to {target_shape}")
-        o, lse = attn_false(q_int8, k_int8, v, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=dtype, attn_mask=attn_mask, return_lse=return_lse)
+        o, lse = attn_false(q_int8, k_int8, v, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=dtype, attn_mask=attn_mask, return_lse=return_lse, delta_s=delta_s)
 
     o = o[..., :head_dim_og]
 
